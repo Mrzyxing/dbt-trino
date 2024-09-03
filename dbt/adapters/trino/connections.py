@@ -1,6 +1,7 @@
 import decimal
 import os
 import re
+import time
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -352,7 +353,37 @@ class ConnectionWrapper(object):
 
             result = self._cursor.execute(sql)
         else:
-            result = self._cursor.execute(sql, params=bindings)
+            try:
+                result = self._cursor.execute(sql, params=bindings)
+            except trino.exceptions.TrinoExternalError as e:
+                print(f">>> catch {e.error_name} which we need retry with 3 times.")
+                return self.retry_execute(sql, bindings, 3)
+
+        self._fetch_result = self._cursor.fetchall()
+        return result
+
+    import time
+    def retry_execute(self, sql, bindings=None, retries=3):
+        # Get the same error if retry too quick, so is Trino get same previously snapshot if retry too quick?
+        time.sleep(1)
+        if not self._prepared_statements_enabled and bindings is not None:
+            # DEPRECATED: by default prepared statements are used.
+            # Code is left as an escape hatch if prepared statements
+            # are failing.
+            bindings = tuple(self._escape_value(b) for b in bindings)
+            sql = sql % bindings
+
+            result = self._cursor.execute(sql)
+        else:
+            try:
+                result = self._cursor.execute(sql, params=bindings)
+            except trino.exceptions.TrinoExternalError as e:
+                if retries == 0:
+                    raise e
+
+                print(f">>> catch {e.error_name} which left {retries} times.")
+                return self.retry_execute(sql, bindings, retries -1)
+
 
         self._fetch_result = self._cursor.fetchall()
         return result
@@ -454,7 +485,7 @@ class TrinoConnectionManager(SQLConnectionManager):
             isolation_level=IsolationLevel.AUTOCOMMIT,
             source=f"dbt-trino-{version}",
             verify=credentials.cert,
-            timezone=credentials.timezone,
+            timezone=credentials.timezone
         )
         connection.state = "open"
         connection.handle = ConnectionWrapper(trino_conn, credentials.prepared_statements_enabled)
